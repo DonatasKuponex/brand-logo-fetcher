@@ -11,10 +11,14 @@ OUT = Path("logos")
 
 WIKIDATA_SEARCH = "https://www.wikidata.org/w/api.php"
 WIKIDATA_ENTITY  = "https://www.wikidata.org/wiki/Special:EntityData/{}.json"
-HEADERS = {"User-Agent": "logo-fetcher/1.1 (+contact: you@example.com)"}
+HEADERS = {"User-Agent": "logo-fetcher/1.2 (+contact: you@example.com)"}
 TIMEOUT = 25
 
-# optional deps
+CLEARBIT_SIZE = 1024         # didesnis rastras iš Clearbit
+PNG_CANVAS = 1024            # normalizuoto PNG drobė
+SVG_PNG_TARGET = 2048        # kiek px generuoti iš SVG (kraštinei)
+
+# optional deps (saugūs importai)
 try:
     from PIL import Image  # type: ignore
     PIL_OK = True
@@ -65,13 +69,18 @@ def try_brandfetch(domain: str):
         r = http_get(f"https://api.brandfetch.io/v2/brands/{domain}",
                      headers={"Authorization": f"Bearer {key}"})
         data = r.json()
-        assets = []
+        # Surenkame visus galimus asset URL, pirmenybė SVG
+        svgs, pngs = [], []
         for block in data.get("logos", []):
             for f in block.get("formats", []):
-                assets.append(f.get("src"))
-        for u in assets:
-            if not u:
-                continue
+                src = f.get("src")
+                if not src:
+                    continue
+                if src.lower().endswith(".svg"):
+                    svgs.append(src)
+                elif src.lower().endswith(".png"):
+                    pngs.append(src)
+        for u in svgs + pngs:
             fmt, blob, src = try_download(u)
             if fmt:
                 return (fmt, blob, src)
@@ -80,12 +89,15 @@ def try_brandfetch(domain: str):
     return (None, None, None)
 
 def try_clearbit(domain: str):
+    # bandome PNG su nurodytu dydžiu
     try:
-        r = http_get(f"https://logo.clearbit.com/{domain}")
+        r = http_get(f"https://logo.clearbit.com/{domain}?size={CLEARBIT_SIZE}")
         c = r.content
         if c[:4] == b"\x89PNG":
             return ("png", c, r.url)
-        if c[:5] == b"<?xml" or b"<svg" in c[:200].lower():
+        # kartais grįžta SVG per redirect
+        head = c[:200].lower()
+        if c[:5] == b"<?xml" or b"<svg" in head:
             return ("svg", c, r.url)
     except Exception:
         pass
@@ -106,12 +118,15 @@ def find_logo_links_in_brand_resources(domain: str):
                     v = tag.get(attr)
                     if not v:
                         continue
-                    if any(v.lower().endswith(ext) for ext in (".svg", ".png", ".zip", ".eps", ".ai", ".pdf")):
+                    v_low = v.lower()
+                    if any(v_low.endswith(ext) for ext in (".svg", ".png")):
                         if v.startswith("//"): v = "https:" + v
                         elif v.startswith("/"): v = f"https://{domain}{v}"
                         links.append(v)
         except Exception:
             continue
+    # pirmenybė svg
+    links = sorted(links, key=lambda x: (0 if x.lower().endswith(".svg") else 1, len(x)))
     return links
 
 def try_download(url: str):
@@ -161,7 +176,7 @@ def try_simple_icons(brand: str):
         pass
     return (None, None, None)
 
-# ---------- Saving ----------
+# ---------- Saving / rendering ----------
 def save_raw(brand: str, fmt: str, blob: bytes) -> str | None:
     slug = slugify(brand)
     if fmt == "svg":
@@ -175,29 +190,38 @@ def save_raw(brand: str, fmt: str, blob: bytes) -> str | None:
     return None
 
 def optional_normalize_png(png_bytes: bytes) -> bytes:
+    """Pad center on 1024x1024 canvas without upscaling small rasters."""
     if not PIL_OK:
         return png_bytes
     try:
         img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
-        size, margin = 1024, 64
         w, h = img.size
-        max_side = size - 2 * margin
-        scale = min(max_side / w, max_side / h)
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        img = img.resize((nw, nh), Image.LANCZOS)
-        canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        canvas.paste(img, ((size - nw) // 2, (size - nh) // 2), img)
+        # Jei PNG jau didelis, nekeičiam rezoliucijos, tik uždedam ant drobės (be resample)
+        if max(w, h) >= PNG_CANVAS:
+            canvas = Image.new("RGBA", (PNG_CANVAS, PNG_CANVAS), (0, 0, 0, 0))
+            # sumažinam per vieną žingsnį tik jei reikia
+            scale = min(PNG_CANVAS / w, PNG_CANVAS / h, 1.0)
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            cw, ch = img.size
+            canvas.paste(img, ((PNG_CANVAS - cw) // 2, (PNG_CANVAS - ch) // 2), img)
+            buff = io.BytesIO()
+            canvas.save(buff, format="PNG")
+            return buff.getvalue()
+        # Jei mažas — neupskeilinam (kad neišplautų), tik padedam į centrą
+        canvas = Image.new("RGBA", (PNG_CANVAS, PNG_CANVAS), (0, 0, 0, 0))
+        canvas.paste(img, ((PNG_CANVAS - w) // 2, (PNG_CANVAS - h) // 2), img)
         buff = io.BytesIO()
         canvas.save(buff, format="PNG")
         return buff.getvalue()
     except Exception:
         return png_bytes
 
-def optional_svg_to_png(svg_bytes: bytes) -> bytes | None:
+def svg_to_png(svg_bytes: bytes, target_px: int = SVG_PNG_TARGET) -> bytes | None:
     if not CAIRO_OK:
         return None
     try:
-        return cairosvg.svg2png(bytestring=svg_bytes)
+        return cairosvg.svg2png(bytestring=svg_bytes, output_width=target_px)
     except Exception:
         return None
 
@@ -215,13 +239,13 @@ def pipeline_for_brand(brand: str):
 
     trials = []
     if domain:
-        trials.append(lambda: try_brandfetch(domain))
-        trials.append(lambda: try_clearbit(domain))
-        for u in find_logo_links_in_brand_resources(domain)[:6]:
+        trials.append(lambda: try_brandfetch(domain))    # dažnai duoda SVG
+        trials.append(lambda: try_clearbit(domain))      # su ?size=1024
+        for u in find_logo_links_in_brand_resources(domain)[:8]:
             trials.append(lambda u=u: try_download(u))
 
-    trials.append(lambda: try_wikimedia(brand))
-    trials.append(lambda: try_simple_icons(brand))
+    trials.append(lambda: try_wikimedia(brand))          # dažnai SVG
+    trials.append(lambda: try_simple_icons(brand))       # visada SVG (mono)
 
     fmt, blob, src = (None, None, None)
     for step in trials:
@@ -234,22 +258,27 @@ def pipeline_for_brand(brand: str):
         rec["notes"] = "Logo not found"
         return rec
 
+    # 1) Visada išsaugome originalą
     path = save_raw(brand, fmt, blob)
     if path and path.endswith(".svg"):
         rec["saved_svg"] = path
-        png_bytes = optional_svg_to_png(blob)
+        # 2) Jei turim SVG ir yra cairosvg — generuojam didelės raiškos PNG
+        png_bytes = svg_to_png(blob, target_px=SVG_PNG_TARGET)
         if png_bytes:
             png_bytes = optional_normalize_png(png_bytes)
             p = OUT / "png" / f"{rec['slug']}.png"
             p.write_bytes(png_bytes)
             rec["saved_png"] = str(p)
+
     elif path and path.endswith(".png"):
         rec["saved_png"] = path
+        # 3) Normalizacija (be privalomo mažinimo ar dirbtinio upscaling)
         norm = optional_normalize_png(blob)
         if norm != blob:
             p = OUT / "png" / f"{rec['slug']}.png"
             p.write_bytes(norm)
             rec["saved_png"] = str(p)
+
     return rec
 
 def main(brands_csv=os.getenv("CSV_PATH", "brands.csv")):
