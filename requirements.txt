@@ -1,6 +1,4 @@
 requests
-Pillow
 beautifulsoup4
-lxml
+Pillow
 cairosvg
-rembg==2.0.56
