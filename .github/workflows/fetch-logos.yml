@@ -1,0 +1,32 @@
+name: Fetch Logos
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: "Path to CSV in repo (default: brands.csv)"
+        required: false
+        default: "brands.csv"
+
+jobs:
+  fetch-logos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcairo2 libpango-1.0-0 libffi8 libjpeg62-turbo zlib1g libpng16-16
+          pip install -r requirements.txt
+      - name: Run fetcher
+        run: python fetch_logos.py
+      - name: Upload logos artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: logos
+          path: logos
+          if-no-files-found: error
